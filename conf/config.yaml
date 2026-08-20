@@ -1,0 +1,228 @@
+project: # Project name
+  name: surface_temperature_surrogate
+  mlflow_db: ${project_dir}/mlflow.db # shared MLflow tracking DB across all runs of this project
+
+exp_tag: lr_${train.optimizer.lr}_ssample_${model.surface_points_sample}_neighbours_${model.num_neighbors_surface}_geo_conv_neur_${model.geometry_rep.geo_conv.base_neurons}
+
+# Main output directory.
+project_dir: outputs/${project.name}/
+output: outputs/${project.name}/${exp_tag}
+
+hydra: # Hydra config
+  run:
+    dir: ${output}
+  output_subdir: hydra
+
+# The directory to search for checkpoints to continue training.
+resume_dir: ${output}/models
+
+# ┌───────────────────────────────────────────┐
+# │            Data Preprocessing             │
+# └───────────────────────────────────────────┘
+data_processor:
+  # Whether to read pre-cached .npy files (CachedDoMINODataset) instead of
+  # reading directly from the .zarr dataset via DoMINODataPipe. This project
+  # always reads directly from .zarr, so this stays false.
+  use_cache: false
+
+# ┌───────────────────────────────────────────┐
+# │            Solution variables             │
+# └───────────────────────────────────────────┘
+# This project is surface-only: each case's .zarr store holds a single scalar
+# "surface_fields" array (see ref_material/zarr_structure.md), which is the
+# surface temperature. There is no volume solution in this dataset, so there
+# is no `variables.volume` block -- DoMINO's data/model code only reads it
+# when model.model_type is "volume" or "combined", which we never use.
+variables:
+  surface:
+    solution:
+      temperature: scalar
+
+  # Boundary conditions for each case, read from the .zarr group's
+  # `global_params_values` array ((6, 1), one row per parameter below, in
+  # this order). `reference` is the non-dimensionalization scale DoMINO uses
+  # for each parameter, and also the fallback value written into
+  # `global_params_reference` if a case's .zarr is missing that array.
+  global_parameters:
+    Temp_inlet:
+      type: scalar
+      reference: [300.0]
+    Mdot_inlet:
+      type: scalar
+      reference: [0.175]
+    Temp_inlet_A:
+      type: scalar
+      reference: [300.0]
+    Mdot_inlet_A:
+      type: scalar
+      reference: [0.01]
+    Temp_inlet_B:
+      type: scalar
+      reference: [300.0]
+    Mdot_inlet_B:
+      type: scalar
+      reference: [0.01]
+
+data: # Input directories for training and validation data (each a folder of *.zarr cases)
+  input_dir: /Users/joshuahellewell/Desktop/claude/scripts/train
+  input_dir_val: /Users/joshuahellewell/Desktop/claude/scripts/val
+  # TODO: set these to the real physical coordinate range of your geometry
+  # (in the same units as stl_coordinates/surface_mesh_centers in your .zarr
+  # files). DoMINO uses this box to normalize coordinates into [-1, 1] and to
+  # place the latent grid used for the geometry encoding. Values below are
+  # placeholders copied from the reference DrivAer config and are almost
+  # certainly wrong for your geometry.
+  bounding_box:
+    min: [-1.0, -1.0, -1.0]
+    max: [1.0, 1.0, 1.0]
+  bounding_box_surface:
+    min: [-1.0, -1.0, -1.0]
+    max: [1.0, 1.0, 1.0]
+  gpu_preprocessing: true # set false if running on CPU (no NVIDIA GPU available)
+  gpu_output: true # set false if running on CPU
+  normalize_coordinates: true
+  sample_in_bbox: false
+  sampling: true
+  scaling_factors: ${project_dir}/scaling_factors/scaling_factors.pkl
+  max_samples_for_statistics: 200
+  # Required by DoMINODataPipe's constructor regardless of model_type; only
+  # meaningful for volume data, which this project doesn't have.
+  volume_sample_from_disk: false
+
+# ┌───────────────────────────────────────────┐
+# │          Model Parameters                 │
+# └───────────────────────────────────────────┘
+model:
+  model_type: surface # this project only supports "surface" -- the dataset has no volume solution
+  activation: "gelu" # "relu" or "gelu"
+  loss_function:
+    loss_type: "mse" # mse or rmse
+    area_weighing_factor: 10000 # generally the inverse of the maximum surface element area
+  interp_res: [128, 64, 64] # resolution of the latent grid used for the geometry encoding
+  use_sdf_in_basis_func: true
+  surface_points_sample: 70000 # number of surface points sampled per case per epoch
+  surface_sampling_algorithm: area_weighted # random or area_weighted
+  geom_points_sample: 30000 # number of STL points sampled per case per epoch
+  num_neighbors_surface: 7 # number of nearest-neighbor surface points used per sampled point
+  use_surface_normals: true
+  use_surface_area: true
+  integral_loss_scaling_factor: 100 # unused for this surface-only, scalar-field project; kept for config parity with DoMINO's model_parameters interface
+  normalization: min_max_scaling # or mean_std_scaling
+  encode_parameters: true # encode the boundary-condition parameters (global_params_values) in the model
+  surf_loss_scaling: 1.0
+  geometry_encoding_type: both # sdf, stl, or both
+  solution_calculation_mode: two-loop # one-loop is faster but only "two-loop" is supported without physics losses disabled here
+  combine_volume_surface: false
+  return_volume_neighbors: false
+
+  # NOTE: DoMINO's model always builds both a volume and a surface geometry
+  # encoder internally (see physicsnemo/models/domino/model.py), even when
+  # model_type is "surface" and output_features_vol=None. The volume_* /
+  # num_neighbors_volume fields below are therefore required for the model to
+  # construct, even though no volume data ever flows through this project.
+  num_neighbors_volume: 10
+  volume_points_sample: 8192
+
+  geometry_rep: # Hyperparameters for geometry representation network
+    geo_conv:
+      base_neurons: 32
+      base_neurons_in: 1
+      base_neurons_out: 1
+      volume_radii: [0.1, 0.5, 1.0, 2.5] # required for model construction; unused (no volume data)
+      surface_radii: [0.01, 0.05, 1.0]
+      surface_hops: 1
+      volume_hops: 1
+      volume_neighbors_in_radius: [32, 64, 128, 256] # required for model construction; unused (no volume data)
+      surface_neighbors_in_radius: [8, 16, 128]
+      fourier_features: false
+      num_modes: 5
+      activation: ${model.activation}
+    geo_processor:
+      base_filters: 8
+      activation: ${model.activation}
+      processor_type: conv # conv or unet (conv is better; fno/fignet not yet supported here)
+      self_attention: false # only usable with unet
+      cross_attention: false # only usable with unet
+      surface_sdf_scaling_factor: [0.01, 0.02, 0.04]
+      volume_sdf_scaling_factor: [0.04] # required for model construction; unused (no volume data)
+  nn_basis_functions: # Hyperparameters for basis function network
+    base_layer: 64
+    fourier_features: true
+    num_modes: 5
+    activation: ${model.activation}
+  local_point_conv:
+    activation: ${model.activation}
+  aggregation_model: # Hyperparameters for aggregation network
+    base_layer: 64
+    activation: ${model.activation}
+  position_encoder: # Hyperparameters for position encoding network
+    base_neurons: 64
+    activation: ${model.activation}
+    fourier_features: true
+    num_modes: 5
+  geometry_local: # Hyperparameters for local geometry extraction
+    volume_neighbors_in_radius: [64, 128] # required for model construction; unused (no volume data)
+    surface_neighbors_in_radius: [32, 128]
+    volume_radii: [0.1, 0.25] # required for model construction; unused (no volume data)
+    surface_radii: [0.05, 0.25]
+    base_layer: 64
+  parameter_model:
+    base_layer: 64
+    fourier_features: false
+    num_modes: 5
+    activation: ${model.activation}
+
+# ┌───────────────────────────────────────────┐
+# │          Training Configs                 │
+# └───────────────────────────────────────────┘
+train: # Training configurable parameters
+  epochs: 1000
+  checkpoint_interval: 2
+  dataloader:
+    preload_depth: 1
+    pin_memory: true # if data.gpu_output is true, this has no effect; set false if gpu_preprocessing/gpu_output are false
+  sampler:
+    shuffle: true
+    drop_last: false
+  lr_scheduler:
+    name: CosineAnnealingLR # or MultiStepLR
+    milestones: [100, 250, 500, 800] # only used if lr_scheduler is MultiStepLR
+    gamma: 0.5 # only used if lr_scheduler is MultiStepLR
+    T_max: ${train.epochs} # only used if lr_scheduler is CosineAnnealingLR
+    eta_min: 1e-6 # only used if lr_scheduler is CosineAnnealingLR
+  optimizer:
+    name: AdamW # or Adam
+    lr: 1e-3
+    weight_decay: 0.05
+  amp:
+    enabled: true # automatically disabled by PyTorch if no CUDA device is available
+    clip_grad: true
+    grad_max_norm: 2.0
+
+# ┌───────────────────────────────────────────┐
+# │          Validation Configs               │
+# └───────────────────────────────────────────┘
+val: # Validation configurable parameters
+  dataloader:
+    preload_depth: 1
+    pin_memory: true
+  sampler:
+    shuffle: true
+    drop_last: false
+
+# ┌───────────────────────────────────────────┐
+# │          Testing data Configs             │
+# └───────────────────────────────────────────┘
+eval: # Testing configurable parameters
+  test_path: data/test # dir of *.zarr test cases, same layout as data.input_dir
+  save_path: outputs/${project.name}/predicted # dir to save predicted-vs-true .vtp point clouds and parity plots
+  # By default, test.py loads the best checkpoint from this run's own
+  # resume_dir/best_model (the highest-epoch file there, written by train.py
+  # whenever validation loss improves). To evaluate a specific historical
+  # run instead of the live model config above, override these two on the
+  # command line:
+  #   eval.model_config=/path/to/old_run/resolved_config.yaml
+  #   eval.model_checkpoint_dir=/path/to/old_run/models/best_model
+  model_config: null
+  model_checkpoint_dir: null
+  save_plots: true

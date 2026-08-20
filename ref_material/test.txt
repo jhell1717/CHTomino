@@ -1,0 +1,640 @@
+ 
+"""
+This code defines a distributed pipeline for testing the DoMINO model
+directly against RAW CHT case data: paired *_solution.h5 (CGNS-like boundary
+connectivity + Temperature) and *_geom.stl (surface geometry) files, i.e. the
+same raw inputs that source.py's H5DataSource decodes for training-data
+curation. There is no pre-consolidated .h5/.vtp/.vtu dataset step here --
+this script parses the raw files itself (via raw_data_utils.py) and runs
+inference straight from them.
+ 
+Scope, by design (this dataset has no volume solution and only a single
+Temperature surface field -- see source.py):
+  - Surface-only. The volume branch, combined-model logic, and the DrivAer
+    drag/lift/side-force aerodynamics block from the original script have
+    all been removed.
+  - Ground truth Temperature (from the raw H5) is compared against the
+    prediction via relative L2 error, same convention as the original script
+    used for surface fields.
+  - Predictions are written out as a point-cloud .vtp (via pyvista) with
+    TemperaturePred / TemperatureTrue point data, since raw cases only give
+    us boundary-face centers (no full VTP mesh/connectivity to write back
+    into).
+  - Predicted-vs-actual parity plots (PNG, via matplotlib) are written
+    alongside the .vtp files: one per case, plus one combined plot over all
+    cases evaluated on this rank. See `plot_pred_vs_true` below.
+
+Required config additions (conf/config.yaml) not present in the original
+DrivAer eval config -- add these under `eval:`:
+    eval:
+      h5_dir: /path/to/raw/h5/dir       # dir of *_solution.h5 files
+      stl_dir: /path/to/raw/stl/dir     # dir of *_geom.stl files (can equal h5_dir)
+      h5_suffix: "_solution.h5"          # optional, matches source.py default
+      stl_suffix: "_geom.stl"            # optional, matches source.py default
+      global_params_csv: null            # optional explicit CSV path; else
+                                          # auto-discovered from h5_dir/parent,
+                                          # same search order as source.py
+      save_path: /path/to/predictions
+      checkpoint_name: <checkpoint file name>  # used only if model_checkpoint below is unset
+      save_plots: true                   # optional, default true -- set false to skip
+                                          # the pred-vs-actual PNG plots below
+ 
+Testing a HISTORICAL model (different architecture/normalization than the
+live conf/config.yaml)
+----------------------------------------------------------------------------
+train.py writes a full `resolved_config.yaml` into each run's output dir
+(cfg.output/resolved_config.yaml), alongside checkpoints under
+cfg.output/models/ and cfg.output/models/best_model/. To evaluate one of
+those historical runs without editing/overwriting your current
+conf/config.yaml, set two more `eval:` keys (via CLI override or config):
+ 
+    eval:
+      model_config: /path/to/old_run/resolved_config.yaml
+      model_checkpoint: /path/to/old_run/models/best_model/<name>.pt  # optional
+ 
+e.g. from the command line:
+    python test.py \
+        eval.h5_dir=/data/new_test_cases \
+        eval.model_config=/runs/2026-03-01_expA/resolved_config.yaml \
+        eval.model_checkpoint=/runs/2026-03-01_expA/models/best_model/model_0450.pt
+ 
+When `eval.model_config` is set, everything about the MODEL itself --
+cfg.model, cfg.variables, cfg.data (bounding box, normalization,
+scaling-factor path, etc.) -- is loaded from that historical
+resolved_config.yaml instead of the live config, since those params must
+match what the checkpoint was actually trained with. Only the `eval.*` block
+(which raw data to test against, where to save predictions) is taken from
+the config this script was invoked with. If `eval.model_checkpoint` is
+omitted, the script looks for `eval.checkpoint_name` next to the resolved
+config, under models/best_model/ then models/ (mirroring train.py's output
+layout). cfg.model.model_type in the resolved (or live) config must be
+"surface" -- the script asserts this at startup.
+ 
+IMPORTANT / please verify before trusting predictions in physical units:
+The original DrivAer script rescaled the unnormalized surface prediction by
+`stream_velocity**2 * air_density` to convert a non-dimensional
+pressure/shear coefficient back into physical units -- that convention is
+specific to how that aerodynamics dataset was curated. For this CHT/Temperature
+dataset, whether an analogous rescale is needed (e.g. dividing/multiplying by
+a reference temperature during curation) depends on logic in the training
+data-curation step that isn't visible in source.py (which only reads raw
+files) or train.py. This script currently outputs whatever
+`unnormalize`/`unstandardize` (per cfg.model.normalization, using the trained
+surf_factors) produces, with NO additional physical-unit rescale applied.
+If your curated training data divided Temperature by a reference value
+before computing surf_factors, add that rescale back in `test_step` before
+trusting absolute predicted temperatures.
+"""
+ 
+import os
+import time
+ 
+import hydra
+from hydra.utils import to_absolute_path
+from omegaconf import DictConfig, OmegaConf
+ 
+# This will set up the cupy-ecosystem and pytorch to share memory pools
+from physicsnemo.utils.memory import unified_gpu_memory
+ 
+import numpy as np
+import pyvista as pv
+
+import matplotlib
+
+matplotlib.use("Agg")  # headless-safe: no X server on training/eval nodes
+import matplotlib.pyplot as plt
+
+import torch
+from torch.nn.parallel import DistributedDataParallel
+ 
+from physicsnemo.distributed import DistributedManager
+from physicsnemo.models.domino.model import DoMINO
+from physicsnemo.utils.domino.utils import *
+from physicsnemo.utils.sdf import signed_distance_field
+from physicsnemo.utils.neighbors import knn
+from utils import ScalingFactors, load_scaling_factors
+ 
+import raw_utils as raw_io
+ 
+ 
+def loss_fn(output, target):
+    masked_loss = torch.mean(((output - target) ** 2.0), (0, 1, 2))
+    loss = torch.mean(masked_loss)
+    return loss
+
+
+def plot_pred_vs_true(pred, true, var_names, save_path, title_prefix="", max_points=200_000):
+    """Save a predicted-vs-actual parity scatter plot to `save_path`.
+
+    One subplot per surface variable (columns of `pred`/`true`), each showing
+    predicted value (y) against ground-truth value (x), a y=x reference line,
+    and the relative L2 error for that variable in the title.
+
+    Args:
+        pred: (N, C) array/tensor of unnormalized predictions.
+        true: (N, C) array/tensor of ground-truth values, same shape as `pred`.
+        var_names: list of C variable names (used for axis labels/titles).
+        save_path: output PNG path.
+        title_prefix: optional string prepended to each subplot title, e.g.
+            f"{case_name} - ".
+        max_points: if N exceeds this, a random subsample is plotted (surface
+            meshes can have hundreds of thousands of points -- plotting all of
+            them makes for a slow, overplotted, huge PNG).
+    """
+    pred = np.asarray(pred)
+    true = np.asarray(true)
+    if pred.ndim == 1:
+        pred = pred[:, None]
+    if true.ndim == 1:
+        true = true[:, None]
+
+    num_points, num_vars = pred.shape
+    if num_points > max_points:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(num_points, size=max_points, replace=False)
+        pred = pred[idx]
+        true = true[idx]
+
+    fig, axes = plt.subplots(1, num_vars, figsize=(6 * num_vars, 5.5), squeeze=False)
+    axes = axes[0]
+
+    for i, ax in enumerate(axes):
+        p = pred[:, i]
+        t = true[:, i]
+        name = var_names[i] if i < len(var_names) else f"var_{i}"
+
+        ax.scatter(t, p, s=2, alpha=0.25, color="tab:blue", linewidths=0)
+
+        lo = float(min(t.min(), p.min()))
+        hi = float(max(t.max(), p.max()))
+        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1, label="y = x")
+
+        rel_l2 = np.sqrt(np.mean((p - t) ** 2)) / (np.sqrt(np.mean(t**2)) + 1e-12)
+        ax.set_xlabel(f"True {name}")
+        ax.set_ylabel(f"Predicted {name}")
+        ax.set_title(f"{title_prefix}{name} (rel. L2 = {rel_l2:.4f})")
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_aspect("equal", adjustable="box")
+        ax.legend(loc="upper left")
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def resolve_model_and_checkpoint(cfg: DictConfig) -> tuple[DictConfig, str]:
+    """Resolve which model config + checkpoint to evaluate.
+ 
+    By default (eval.model_config unset), uses the live hydra config for
+    everything, same as before: model_cfg is just `cfg`, and the checkpoint
+    is cfg.resume_dir/cfg.eval.checkpoint_name.
+ 
+    To test a historical model whose architecture/normalization differs from
+    the current conf/config.yaml, set eval.model_config to that run's
+    resolved_config.yaml (written by train.py). model_cfg.model,
+    model_cfg.variables, and model_cfg.data are then used for everything
+    model/normalization-related, while eval.* (data location, save path)
+    still comes from the live `cfg` passed to this script. eval.checkpoint_name
+    also still comes from the live `cfg` -- it's just the *filename* looked up
+    relative to the historical run's directory when eval.model_checkpoint
+    isn't given explicitly.
+    """
+    model_config_path = cfg.eval.get("model_config", None)
+    model_checkpoint_path = cfg.eval.get("model_checkpoint", None)
+ 
+    if model_config_path is None:
+        checkpoint_path = model_checkpoint_path or os.path.join(
+            cfg.resume_dir, cfg.eval.checkpoint_name
+        )
+        return cfg, to_absolute_path(checkpoint_path)
+ 
+    model_config_path = to_absolute_path(model_config_path)
+    model_cfg = OmegaConf.load(model_config_path)
+    print(f"Loaded historical model config from '{model_config_path}'")
+ 
+    if model_checkpoint_path:
+        checkpoint_path = to_absolute_path(model_checkpoint_path)
+    else:
+        run_dir = os.path.dirname(model_config_path)
+        candidates = [
+            os.path.join(run_dir, "models", "best_model", cfg.eval.checkpoint_name),
+            os.path.join(run_dir, "models", cfg.eval.checkpoint_name),
+        ]
+        checkpoint_path = next((c for c in candidates if os.path.exists(c)), None)
+        if checkpoint_path is None:
+            raise FileNotFoundError(
+                "eval.model_config was set but eval.model_checkpoint was not, and no "
+                f"checkpoint named '{cfg.eval.checkpoint_name}' was found next to it. "
+                f"Looked in: {candidates}. Set eval.model_checkpoint explicitly to the "
+                "historical checkpoint's .pt path."
+            )
+ 
+    return model_cfg, checkpoint_path
+ 
+ 
+def test_step(data_dict, model, device, model_cfg, surf_factors):
+    """Run one surface-only inference step and return unnormalized predictions."""
+    with torch.no_grad():
+        point_batch_size = 256000
+ 
+        # STL nodes
+        geo_centers = data_dict["geometry_coordinates"]
+ 
+        # Bounding box grid
+        s_grid = data_dict["surf_grid"]
+        sdf_surf_grid = data_dict["sdf_surf_grid"]
+        # Scaling factors
+        surf_max = data_dict["surface_min_max"][:, 1]
+        surf_min = data_dict["surface_min_max"][:, 0]
+ 
+        # Represent geometry on bounding box
+        geo_centers_surf = 2.0 * (geo_centers - surf_min) / (surf_max - surf_min) - 1
+        encoding_g_surf = model.geo_rep_surface(geo_centers_surf, s_grid, sdf_surf_grid)
+ 
+        # Sampled points on surface
+        surface_mesh_centers = data_dict["surface_mesh_centers"]
+        surface_normals = data_dict["surface_normals"]
+        surface_areas = data_dict["surface_areas"]
+ 
+        # Neighbors of sampled points on surface
+        surface_mesh_neighbors = data_dict["surface_mesh_neighbors"]
+        surface_neighbors_normals = data_dict["surface_neighbors_normals"]
+        surface_neighbors_areas = data_dict["surface_neighbors_areas"]
+        surface_areas = torch.unsqueeze(surface_areas, -1)
+        surface_neighbors_areas = torch.unsqueeze(surface_neighbors_areas, -1)
+        pos_surface_center_of_mass = data_dict["pos_surface_center_of_mass"]
+        num_points = surface_mesh_centers.shape[1]
+        subdomain_points = int(np.floor(num_points / point_batch_size))
+ 
+        global_params_values = data_dict["global_params_values"]
+        global_params_reference = data_dict["global_params_reference"]
+ 
+        target_surf = data_dict["surface_fields"]
+        prediction_surf = torch.zeros_like(target_surf)
+ 
+        running_tloss_surf = 0.0
+ 
+        for p in range(subdomain_points + 1):
+            start_idx = p * point_batch_size
+            end_idx = (p + 1) * point_batch_size
+            with torch.no_grad():
+                target_batch = target_surf[:, start_idx:end_idx]
+                surface_mesh_centers_batch = surface_mesh_centers[:, start_idx:end_idx]
+                surface_mesh_neighbors_batch = surface_mesh_neighbors[:, start_idx:end_idx]
+                surface_normals_batch = surface_normals[:, start_idx:end_idx]
+                surface_neighbors_normals_batch = surface_neighbors_normals[:, start_idx:end_idx]
+                surface_areas_batch = surface_areas[:, start_idx:end_idx]
+                surface_neighbors_areas_batch = surface_neighbors_areas[:, start_idx:end_idx]
+                pos_surface_center_of_mass_batch = pos_surface_center_of_mass[:, start_idx:end_idx]
+ 
+                geo_encoding_local = model.surface_local_geo_encodings(
+                    0.5 * encoding_g_surf,
+                    surface_mesh_centers_batch,
+                    s_grid,
+                )
+                pos_encoding = model.fc_p_surf(pos_surface_center_of_mass_batch)
+ 
+                tpredictions_batch = model.solution_calculator_surf(
+                    surface_mesh_centers_batch,
+                    geo_encoding_local,
+                    pos_encoding,
+                    surface_mesh_neighbors_batch,
+                    surface_normals_batch,
+                    surface_neighbors_normals_batch,
+                    surface_areas_batch,
+                    surface_neighbors_areas_batch,
+                    global_params_values,
+                    global_params_reference,
+                )
+ 
+                running_tloss_surf += loss_fn(tpredictions_batch, target_batch)
+                prediction_surf[:, start_idx:end_idx] = tpredictions_batch
+ 
+        if model_cfg.model.normalization == "min_max_scaling":
+            prediction_surf = unnormalize(prediction_surf, surf_factors[0], surf_factors[1])
+        elif model_cfg.model.normalization == "mean_std_scaling":
+            prediction_surf = unstandardize(prediction_surf, surf_factors[0], surf_factors[1])
+ 
+        # NOTE: no physical-unit rescale is applied here -- see module
+        # docstring. The DrivAer original multiplied by
+        # stream_velocity**2 * air_density to undo a dynamic-pressure
+        # non-dimensionalization; that convention doesn't carry over to
+        # Temperature. Add the equivalent step here if your training data
+        # curation applied one.
+ 
+    return prediction_surf
+ 
+ 
+@hydra.main(version_base="1.3", config_path="conf", config_name="config")
+def main(cfg: DictConfig):
+    print(f"Config summary:\n{OmegaConf.to_yaml(cfg, sort_keys=True)}")
+ 
+    model_cfg, checkpoint_path = resolve_model_and_checkpoint(cfg)
+    if model_cfg is not cfg:
+        print(f"Using checkpoint: {checkpoint_path}")
+ 
+    if model_cfg.model.model_type != "surface":
+        raise ValueError(
+            "This raw-data test script only supports model_type == 'surface': the raw "
+            "*_solution.h5 / *_geom.stl cases only contain surface boundary data (no volume "
+            f"solution). Got model_type={model_cfg.model.model_type!r} (from "
+            f"{'eval.model_config' if model_cfg is not cfg else 'the live config'})."
+        )
+ 
+    h5_dir = to_absolute_path(cfg.eval.h5_dir)
+    stl_dir = to_absolute_path(cfg.eval.get("stl_dir", cfg.eval.h5_dir))
+    h5_suffix = cfg.eval.get("h5_suffix", "_solution.h5")
+    stl_suffix = cfg.eval.get("stl_suffix", "_geom.stl")
+    global_params_csv = cfg.eval.get("global_params_csv", None)
+ 
+    # initialize distributed manager
+    DistributedManager.initialize()
+    dist = DistributedManager()
+ 
+    surface_variable_names = list(model_cfg.variables.surface.solution.keys())
+    num_surf_vars = 0
+    for j in surface_variable_names:
+        if model_cfg.variables.surface.solution[j] == "vector":
+            num_surf_vars += 3
+        else:
+            num_surf_vars += 1
+ 
+    global_features = 0
+    global_params_names_cfg = list(model_cfg.variables.global_parameters.keys())
+    for param in global_params_names_cfg:
+        if model_cfg.variables.global_parameters[param].type == "vector":
+            global_features += len(model_cfg.variables.global_parameters[param].reference)
+        else:
+            global_features += 1
+ 
+    ######################################################
+    # Get scaling factors - precompute them if this fails!
+    ######################################################
+    surf_factors = load_scaling_factors(model_cfg)
+    print("Surf factors:", surf_factors)
+ 
+    model = DoMINO(
+        input_features=3,
+        output_features_vol=None,
+        output_features_surf=num_surf_vars,
+        global_features=global_features,
+        model_parameters=model_cfg.model,
+    ).to(dist.device)
+ 
+    model = torch.compile(model, disable=True)
+ 
+    checkpoint = torch.load(checkpoint_path, map_location=dist.device)
+ 
+    model.load_state_dict(checkpoint)
+ 
+    print("Model loaded")
+ 
+    if dist.world_size > 1:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[dist.local_rank],
+            output_device=dist.device,
+            broadcast_buffers=dist.broadcast_buffers,
+            find_unused_parameters=dist.find_unused_parameters,
+            gradient_as_bucket_view=True,
+            static_graph=True,
+        )
+        model = model.module
+ 
+    # Discover raw cases (paired *_solution.h5 / *_geom.stl) and the CSV-driven
+    # global parameter table, same discovery rules as source.py's H5DataSource.
+    # case_names = raw_io.get_case_list(h5_dir, h5_suffix=h5_suffix)
+    case_names = raw_io.get_case_list(h5_dir, h5_filename=cfg.eval.get("h5_filename", "cells_and_vertices.h5"))
+    
+    global_param_names, global_param_values_by_case = raw_io.load_global_param_table(
+        h5_dir, global_params_csv
+    )
+    print(
+        f"Found {len(case_names)} raw case(s); global parameters: "
+        f"{global_param_names or list(raw_io.GLOBAL_PARAM_REFERENCE_BY_NAME.keys())}"
+    )
+ 
+    dev_id = torch.cuda.current_device()
+    num_files = int(len(case_names) / dist.world_size)
+    case_names_per_gpu = case_names[int(num_files * dev_id) : int(num_files * (dev_id + 1))]
+ 
+    pred_save_path = cfg.eval.save_path
+    save_plots = cfg.eval.get("save_plots", True)
+
+    if dist.rank == 0:
+        create_directory(pred_save_path)
+
+    l2_surface_all = []
+    all_pred_for_plot = []
+    all_true_for_plot = []
+    for count, case_name in enumerate(case_names_per_gpu):
+        case = raw_io.load_raw_case(
+            input_dir=h5_dir, stl_dir=stl_dir, case_name=case_name,
+            h5_filename=cfg.eval.get("h5_filename", "cells_and_vertices.h5"),
+            stl_suffix=stl_suffix,
+            global_param_names=global_param_names,
+            global_param_values_by_case=global_param_values_by_case,
+        )
+
+        # case = raw_io.load_raw_case(
+        #     input_dir=h5_dir,
+        #     stl_dir=stl_dir,
+        #     case_name=case_name,
+        #     h5_suffix=h5_suffix,
+        #     stl_suffix=stl_suffix,
+        #     global_param_names=global_param_names,
+        #     global_param_values_by_case=global_param_values_by_case,
+        # )
+        stl_path = case["stl_path"]
+ 
+        vtp_pred_save_path = os.path.join(pred_save_path, f"{case_name}_predicted.vtp")
+ 
+        if "global_params_values" not in case:
+            raise ValueError(
+                f"No global parameter values found for case '{case_name}' -- check that a "
+                "CSV with a matching 'Case' number exists in h5_dir (or its parent), or pass "
+                "cfg.eval.global_params_csv explicitly."
+            )
+ 
+        # Read STL
+        reader = pv.get_reader(stl_path)
+        mesh_stl = reader.read()
+        stl_vertices = mesh_stl.points
+        stl_faces = np.array(mesh_stl.faces).reshape((-1, 4))[
+            :, 1:
+        ]  # Assuming triangular elements
+        mesh_indices_flattened = stl_faces.flatten()
+        length_scale = np.array(
+            np.amax(np.amax(stl_vertices, 0) - np.amin(stl_vertices, 0)),
+            dtype=np.float32,
+        )
+        length_scale = torch.from_numpy(length_scale).to(torch.float32).to(dist.device)
+        stl_sizes = mesh_stl.compute_cell_sizes(length=False, area=True, volume=False)
+        stl_sizes = np.array(stl_sizes.cell_data["Area"], dtype=np.float32)
+        stl_centers = np.array(mesh_stl.cell_centers().points, dtype=np.float32)
+ 
+        # Convert to torch tensors and load on device
+        stl_vertices = torch.from_numpy(stl_vertices).to(torch.float32).to(dist.device)
+        stl_sizes = torch.from_numpy(stl_sizes).to(torch.float32).to(dist.device)
+        stl_centers = torch.from_numpy(stl_centers).to(torch.float32).to(dist.device)
+        mesh_indices_flattened = (
+            torch.from_numpy(mesh_indices_flattened).to(torch.int32).to(dist.device)
+        )
+ 
+        # Center of mass calculation
+        center_of_mass = calculate_center_of_mass(stl_centers, stl_sizes)
+ 
+        s_max = (
+            torch.from_numpy(np.asarray(model_cfg.data.bounding_box_surface.max))
+            .to(torch.float32)
+            .to(dist.device)
+        )
+        s_min = (
+            torch.from_numpy(np.asarray(model_cfg.data.bounding_box_surface.min))
+            .to(torch.float32)
+            .to(dist.device)
+        )
+ 
+        nx, ny, nz = model_cfg.model.interp_res
+ 
+        surf_grid = create_grid(
+            s_max, s_min, torch.from_numpy(np.asarray([nx, ny, nz])).to(dist.device)
+        )
+ 
+        normed_stl_vertices_cp = normalize(stl_vertices, s_max, s_min)
+        surf_grid_normed = normalize(surf_grid, s_max, s_min)
+ 
+        # SDF calculation on the grid using WARP
+        sdf_surf_grid, _ = signed_distance_field(
+            normed_stl_vertices_cp,
+            mesh_indices_flattened,
+            surf_grid_normed,
+            use_sign_winding_number=True,
+        )
+ 
+        surf_grid_max_min = torch.stack([s_min, s_max])
+ 
+        global_params_values = (
+            torch.from_numpy(case["global_params_values"]).to(torch.float32).to(dist.device)
+        )
+        global_params_reference = (
+            torch.from_numpy(case["global_params_reference"]).to(torch.float32).to(dist.device)
+        )
+ 
+        # Boundary surface data decoded directly from the raw *_solution.h5
+        # (replaces the VTP read in the original DrivAer script).
+        surface_coordinates = (
+            torch.from_numpy(case["surface_mesh_centers"]).to(torch.float32).to(dist.device)
+        )
+        surface_normals = (
+            torch.from_numpy(case["surface_normals"]).to(torch.float32).to(dist.device)
+        )
+        surface_sizes = (
+            torch.from_numpy(case["surface_areas"]).to(torch.float32).to(dist.device)
+        )
+        surface_fields = (
+            torch.from_numpy(case["surface_fields"]).to(torch.float32).to(dist.device)
+        )
+        # Keep un-normalized physical coordinates around for writing predictions.
+        surface_coordinates_phys = surface_coordinates.clone()
+ 
+        if model_cfg.model.num_neighbors_surface > 1:
+            ii, dd = knn(
+                points=surface_coordinates,
+                queries=surface_coordinates,
+                k=model_cfg.model.num_neighbors_surface,
+            )
+ 
+            surface_neighbors = surface_coordinates[ii][:, 1:]
+            surface_neighbors_normals = surface_normals[ii][:, 1:]
+            surface_neighbors_sizes = surface_sizes[ii][:, 1:]
+        else:
+            surface_neighbors = surface_coordinates
+            surface_neighbors_normals = surface_normals
+            surface_neighbors_sizes = surface_sizes
+ 
+        if model_cfg.data.normalize_coordinates:
+            surface_coordinates = normalize(surface_coordinates, s_max, s_min)
+            surf_grid = normalize(surf_grid, s_max, s_min)
+            center_of_mass_normalized = normalize(center_of_mass, s_max, s_min)
+            surface_neighbors = normalize(surface_neighbors, s_max, s_min)
+        else:
+            center_of_mass_normalized = center_of_mass
+        pos_surface_center_of_mass = surface_coordinates - center_of_mass_normalized
+ 
+        geom_centers = stl_vertices
+ 
+        data_dict = {
+            "pos_surface_center_of_mass": pos_surface_center_of_mass,
+            "geometry_coordinates": geom_centers,
+            "surf_grid": surf_grid,
+            "sdf_surf_grid": sdf_surf_grid,
+            "surface_mesh_centers": surface_coordinates,
+            "surface_mesh_neighbors": surface_neighbors,
+            "surface_normals": surface_normals,
+            "surface_neighbors_normals": surface_neighbors_normals,
+            "surface_areas": surface_sizes,
+            "surface_neighbors_areas": surface_neighbors_sizes,
+            "surface_fields": surface_fields,
+            "surface_min_max": surf_grid_max_min,
+            "length_scale": length_scale,
+            "global_params_values": global_params_values,
+            "global_params_reference": global_params_reference,
+        }
+ 
+        data_dict = {key: torch.unsqueeze(value, 0) for key, value in data_dict.items()}
+ 
+        prediction_surf = test_step(data_dict, model, dist.device, model_cfg, surf_factors)
+ 
+        # Relative L2 error against ground-truth Temperature decoded from the raw H5.
+        l2_gt = torch.mean(torch.square(surface_fields), (0))
+        l2_error = torch.mean(torch.square(prediction_surf[0] - surface_fields), (0))
+        rel_l2 = np.sqrt(l2_error.cpu().numpy()) / np.sqrt(l2_gt.cpu().numpy())
+        l2_surface_all.append(rel_l2)
+        print(f"Surface L-2 norm ({surface_variable_names}):", case_name, rel_l2)
+ 
+        # Save prediction as a point cloud VTP (no source mesh connectivity to
+        # write back into, since raw cases only give boundary-face centers).
+        pred_cloud = pv.PolyData(surface_coordinates_phys.cpu().numpy())
+        pred_cloud[f"{surface_variable_names[0]}Pred"] = (
+            prediction_surf[0, :, 0:1].cpu().numpy()
+        )
+        pred_cloud[f"{surface_variable_names[0]}True"] = surface_fields[:, 0:1].cpu().numpy()
+        pred_cloud.save(vtp_pred_save_path)
+
+        # Predicted-vs-actual parity plot for this case.
+        if save_plots:
+            pred_np = prediction_surf[0].cpu().numpy()
+            true_np = surface_fields.cpu().numpy()
+            plot_save_path = os.path.join(pred_save_path, f"{case_name}_pred_vs_true.png")
+            plot_pred_vs_true(
+                pred_np,
+                true_np,
+                surface_variable_names,
+                plot_save_path,
+                title_prefix=f"{case_name} - ",
+            )
+            all_pred_for_plot.append(pred_np)
+            all_true_for_plot.append(true_np)
+
+    if save_plots and all_pred_for_plot:
+        combined_plot_path = os.path.join(
+            pred_save_path, f"all_cases_pred_vs_true_rank{dist.rank}.png"
+        )
+        plot_pred_vs_true(
+            np.concatenate(all_pred_for_plot, axis=0),
+            np.concatenate(all_true_for_plot, axis=0),
+            surface_variable_names,
+            combined_plot_path,
+            title_prefix=f"All cases (rank {dist.rank}) - ",
+        )
+        print(f"Saved combined pred-vs-actual plot to '{combined_plot_path}'")
+
+    l2_surface_all = np.asarray(l2_surface_all)  # num_files, num_surf_vars
+    l2_surface_mean = np.mean(l2_surface_all, 0)
+    print(f"Mean over all samples, surface={l2_surface_mean}")
+ 
+ 
+if __name__ == "__main__":
+    main()

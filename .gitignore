@@ -1,0 +1,20 @@
+# Environments
+.venv/
+__pycache__/
+*.pyc
+
+# Hydra / training outputs
+outputs/
+multirun/
+
+# MLflow
+mlruns/
+mlflow.db
+*.db
+
+# Data and derived artifacts (typically large / machine-specific)
+data/
+*.zarr/
+scaling_factors*.pkl
+*.pt
+*.mdlus
