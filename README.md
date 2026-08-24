@@ -188,6 +188,24 @@ What to do differently there vs. the local setup described above:
    built `Handle`, matching physicsnemo's own later (v2.1.1) fix. It's
    unverified the same way -- there's no cuML/GPU in the environment this
    project was built in.
+
+   **If you can't get cuML working at all** and need to unblock evaluation
+   in the meantime: `test.py` defaults to evaluating each case's *full*
+   surface mesh, which is exactly what makes the brute-force fallback OOm
+   (`full_mesh_points x full_mesh_points`). Set `eval.sampling=true` and
+   `eval.surface_points_sample=<N>` (see `conf/config.yaml` for the sizing
+   formula) to evaluate a bounded random subset of each case's surface
+   instead -- trades complete per-case coverage for something that actually
+   fits the brute-force fallback's memory, e.g.:
+   ```bash
+   python test.py eval.sampling=true eval.surface_points_sample=4096
+   ```
+   This does not touch training (`train.py` always uses cuML if available,
+   the brute-force fallback otherwise, at `model.surface_points_sample`, and
+   OOMs the same way without cuML -- there's no equivalent workaround for
+   training, since a representative training sample can't be shrunk this far
+   without hurting the model). Switch back to `eval.sampling=false` once
+   cuML is working, for real full-mesh evaluation.
 5. Leave `data.gpu_preprocessing` / `data.gpu_output` / `train.amp.enabled`
    as `true` (the checked-in defaults) rather than the `false` overrides used
    for the local CPU smoke test.
