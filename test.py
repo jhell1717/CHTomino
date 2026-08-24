@@ -151,6 +151,18 @@ def main(cfg: DictConfig) -> None:
     dataset_cfg.eval = cfg.eval
     dataset_cfg.data_processor = cfg.data_processor
 
+    eval_sampling = cfg.eval.get("sampling", False)
+    if eval_sampling:
+        # create_domino_dataset reads the sample count from cfg.model, not
+        # from a dedicated eval.* value, so borrow the field for this call.
+        # See conf/config.yaml eval.sampling for why you'd want this: it's a
+        # workaround for evaluating without RAPIDS cuML available.
+        dataset_cfg.model.surface_points_sample = cfg.eval.surface_points_sample
+        print(
+            f"eval.sampling=true: evaluating a random {cfg.eval.surface_points_sample}-point "
+            "subset of each case's surface mesh, not the full mesh."
+        )
+
     test_dataloader = create_domino_dataset(
         dataset_cfg,
         phase="test",
@@ -160,7 +172,7 @@ def main(cfg: DictConfig) -> None:
         surf_factors=surf_factors,
         normalize_coordinates=model_cfg.data.normalize_coordinates,
         sample_in_bbox=model_cfg.data.sample_in_bbox,
-        sampling=False,  # evaluate the full surface mesh, not a random sample
+        sampling=eval_sampling,
     )
 
     case_names = [p.stem for p in getattr(test_dataloader.dataset, "_filenames", [])]

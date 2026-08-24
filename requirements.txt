@@ -19,6 +19,35 @@ torch>=2.4.0
 #   nvidia-dali-cuda110>=1.35.0   # CUDA 11.x
 # Not pip-installable on macOS/no-GPU machines -- that's what the stub is for.
 
+# REQUIRED on GPU for any non-trivial mesh size (see README "Moving to a real
+# NVIDIA GPU"): physicsnemo.utils.neighbors.knn() silently falls back to an
+# unchunked O(N*M) brute-force torch implementation whenever RAPIDS cuML
+# isn't importable, which OOMs even on an 80GB+ GPU at realistic (~100k+
+# point) surface-mesh sizes.
+#
+# physicsnemo 1.3.0's cuML backend manually builds a `cuml.Handle(...)`,
+# which newer RAPIDS releases removed from cuml's top-level namespace
+# (confirmed: physicsnemo's own fix for this, in v2.1.1, drops the Handle
+# entirely and bumps its floor to cuml>=26.2.0 -- see README). physicsnemo
+# 1.3.0 itself only declares cuml>=24.0.0, but its own Dockerfile is built on
+# nvcr.io/nvidia/pytorch:25.09-py3 (released 2025-11-18), i.e. it was
+# actually built/tested against a 25.x RAPIDS release, not an old 24.x one.
+# So: pin to a 25.x release rather than letting pip grab whatever is newest.
+# Install from the RAPIDS pip index, matching your CUDA major version
+# (uncomment one) -- not installable on macOS/no-GPU machines, so this can't
+# be in the base requirements list above:
+#   --extra-index-url=https://pypi.nvidia.com
+#   cuml-cu12==25.10.*   # CUDA 12.x (H100 VMs are almost always this)
+#   cuml-cu11==25.10.*   # CUDA 11.x
+#
+# This exact point release is a well-supported guess, not a guarantee -- if
+# `python -c "import cuml; print(cuml.Handle)"` still fails after installing
+# it, try adjacent RAPIDS releases (25.08.*, 25.06.*, ... -- run
+# `pip index versions cuml-cu12` to list what's available) until it works.
+# cuml_knn_patch.py in this repo is a code-level fallback (not imported by
+# default) if no 25.x point release has `cuml.Handle` on your setup -- see
+# README "Moving to a real NVIDIA GPU" for how to enable it.
+
 # physicsnemo 1.3.0's neighbor/radius_search and SDF code (used by DoMINO's
 # datapipe) breaks on warp-lang >= 1.8 (`AttributeError: module 'warp' has no
 # attribute 'context'` at import time). Pin to a version verified to work.

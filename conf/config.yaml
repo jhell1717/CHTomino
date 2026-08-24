@@ -226,3 +226,21 @@ eval: # Testing configurable parameters
   model_config: null
   model_checkpoint_dir: null
   save_plots: true
+  # By default (false) test.py evaluates the FULL surface mesh per case, no
+  # subsampling -- the same as `sample_in_bbox`/`sampling` at train time
+  # would normally be for eval. This requires physicsnemo's kNN search
+  # (DoMINODataPipe.process_surface) to run at (full_mesh_points^2) scale.
+  # With RAPIDS cuML available that's fine; WITHOUT it, physicsnemo silently
+  # falls back to an unchunked brute-force torch implementation whose memory
+  # cost is full_mesh_points * surface_points_sample * 12 bytes, which OOMs
+  # even on an 80GB+ GPU at real mesh sizes (see README "Moving to a real
+  # NVIDIA GPU"). If you can't get cuML working, set sampling=true here to
+  # evaluate a bounded random subset of each case's surface instead of the
+  # full mesh -- trades complete per-case coverage for something that
+  # actually fits that fallback's memory. Rough sizing: keep
+  # surface_points_sample below (your free GPU memory in bytes) / (full mesh
+  # point count * 12); e.g. ~4000 is safe up to a ~400k-point mesh on a
+  # ~90GB-free GPU. Switch back to sampling=false once cuML is working, for
+  # real full-mesh evaluation.
+  sampling: false
+  surface_points_sample: 4096

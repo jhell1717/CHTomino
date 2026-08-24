@@ -139,29 +139,79 @@ What to do differently there vs. the local setup described above:
 3. **Keep the `warp-lang==1.7.2` pin.** The incompatibility it works around
    (`warp-lang >= 1.8` breaking physicsnemo 1.3.0's neighbor/SDF imports) is
    a warp API-version issue, not a CPU-vs-GPU one -- it applies on the VM too.
-4. Leave `data.gpu_preprocessing` / `data.gpu_output` / `train.amp.enabled`
+4. **Install RAPIDS cuML -- required, not optional, for any non-trivial mesh
+   size.** `physicsnemo.utils.neighbors.knn()` (used by `DoMINODataPipe` on
+   every case, for both training and evaluation) picks its backend based on
+   what's importable: on CUDA points it uses cuML if available, otherwise it
+   silently falls back to an *unchunked* brute-force torch implementation
+   that materializes the full (N_points x N_queries x 3) pairwise-distance
+   tensor in one allocation. At real surface-mesh sizes (hundreds of
+   thousands of points) that's hundreds of GB to multiple TB -- it will OOM
+   even on an H100, regardless of batch size or sample count, the moment
+   `N_points x N_queries` gets large. There's no config flag for this; it's
+   purely about whether `cuml` is importable in your environment.
+
+   physicsnemo 1.3.0's cuML backend manually builds a `cuml.Handle(...)` to
+   bind the search to PyTorch's current CUDA stream. RAPIDS removed `Handle`
+   from `cuml`'s top-level namespace at some point after physicsnemo 1.3.0
+   was built (confirmed: physicsnemo's own fix for this exact bug, in
+   v2.1.1, drops `Handle` entirely and requires `cuml>=26.2.0`), so
+   `pip install cuml-cu12` (unpinned -- physicsnemo's own floor is just
+   `>=24.0.0`) grabbing today's latest release hits
+   `AttributeError: module cuml has no attribute Handle` the first time
+   `DoMINODataPipe` runs a kNN search. physicsnemo 1.3.0's own `Dockerfile`
+   is built on `nvcr.io/nvidia/pytorch:25.09-py3` (released 2025-11-18), so
+   it was actually tested against a **25.x** RAPIDS release, not an old 24.x
+   one. Install a pinned 25.x point release instead of an unpinned one (see
+   `requirements.txt`):
+   ```bash
+   pip install --extra-index-url=https://pypi.nvidia.com "cuml-cu12==25.10.*"  # or cuml-cu11 for CUDA 11.x
+   ```
+   Verify it's actually being picked up before running anything expensive:
+   ```bash
+   python -c "from physicsnemo.utils.neighbors.knn._cuml_impl import CUML_AVAILABLE; print(CUML_AVAILABLE)"
+   python -c "import cuml; print(cuml.Handle)"
+   ```
+   the first should print `True`, the second should print a class, not raise
+   `AttributeError`. No code changes needed once this is true --
+   `knn(backend="auto")` dispatches to it automatically.
+
+   `25.10.*` is a well-supported guess, not a guarantee -- if `cuml.Handle`
+   still doesn't exist, try adjacent point releases (`25.08.*`, `25.06.*`,
+   ... run `pip index versions cuml-cu12` to see what's available) until one
+   works. If no 25.x release has `cuml.Handle` on your setup,
+   `cuml_knn_patch.py` in this repo is a code-level fallback (not imported
+   by default -- add `import cuml_knn_patch` to the top of whichever script
+   you're running, before any other physicsnemo import, to enable it): it
+   reimplements physicsnemo's kNN dispatch but routes the cuML backend
+   through `cuml.neighbors.NearestNeighbors` directly instead of a manually
+   built `Handle`, matching physicsnemo's own later (v2.1.1) fix. It's
+   unverified the same way -- there's no cuML/GPU in the environment this
+   project was built in.
+5. Leave `data.gpu_preprocessing` / `data.gpu_output` / `train.amp.enabled`
    as `true` (the checked-in defaults) rather than the `false` overrides used
    for the local CPU smoke test.
-5. **Set `data.bounding_box` / `data.bounding_box_surface`** to your real
+6. **Set `data.bounding_box` / `data.bounding_box_surface`** to your real
    geometry's coordinate range (see the Dataset section above) and point
    `data.input_dir` / `data.input_dir_val` / `eval.test_path` at your real
    `.zarr` data.
-6. Run `tests/run_smoke_test.sh` there first (with the real DALI installed,
-   no stub) as a fast sanity check that the environment itself is sound,
-   before a full training run.
+7. Run `tests/run_smoke_test.sh` there first (with the real DALI and cuML
+   installed, no stub) as a fast sanity check that the environment itself is
+   sound, before a full training run.
 
 **What's genuinely unverified**, since no GPU was available while building
 this: the GPU-specific code paths themselves (device transfer,
 `GradScaler`/`autocast` actually running in float16, `pynvml` memory
-logging), full-scale hyperparameters (`interp_res: [128, 64, 64]`,
-`surface_points_sample: 70000`, `geom_points_sample: 30000` -- standard
-DoMINO-scale settings, but never run here even on the tiny synthetic data,
-so unconfirmed for memory fit / throughput on your setup), NVIDIA DALI's own
-import behavior (untestable without a real install), and everything about
-real CFD/CHT data (only synthetic data was used). If something breaks on
-the VM, it's most likely one of those, not the surface-only pipeline logic
-itself (data loading, model construction/forward/backward, loss,
-checkpointing, evaluation), which the smoke test does cover.
+logging, the cuML-backed `knn()` path above), full-scale hyperparameters
+(`interp_res: [128, 64, 64]`, `surface_points_sample: 70000`,
+`geom_points_sample: 30000` -- standard DoMINO-scale settings, but never run
+here even on the tiny synthetic data, so unconfirmed for memory fit /
+throughput on your setup), NVIDIA DALI's own import behavior (untestable
+without a real install), and everything about real CFD/CHT data (only
+synthetic data was used). If something breaks on the VM, it's most likely
+one of those, not the surface-only pipeline logic itself (data loading,
+model construction/forward/backward, loss, checkpointing, evaluation), which
+the smoke test does cover.
 
 ## What changed from the reference scripts (`ref_material/`)
 
@@ -252,6 +302,7 @@ train.py                 Training loop
 test.py                  Evaluate a checkpoint against held-out .zarr test cases
 utils.py                 Config-derived sizing, scaling factors, L2 metrics
 loss.py                  Surface loss (point-wise + area-weighted)
+cuml_knn_patch.py        GPU-only: works around a RAPIDS/physicsnemo cuML API mismatch -- see "Moving to a real NVIDIA GPU"
 scripts/make_synthetic_zarr.py   Generate tiny fake .zarr cases (demo / smoke test)
 tests/run_smoke_test.sh  End-to-end pipeline smoke test (see above)
 devtools/dali_stub/      Local-only import shim -- see "Environment notes"
