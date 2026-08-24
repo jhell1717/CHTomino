@@ -19,6 +19,7 @@ from physicsnemo.datapipes.cae.domino_datapipe import compute_scaling_factors
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
 
+import cuml_knn_patch  # noqa: F401  -- see that file: works around a RAPIDS/physicsnemo cuML API mismatch
 from utils import ScalingFactors, assert_surface_only
 
 TARGET_KEYS = ["surface_fields", "stl_centers", "surface_mesh_centers"]

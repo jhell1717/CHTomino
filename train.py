@@ -28,6 +28,7 @@ from physicsnemo.launch.utils import load_checkpoint, save_checkpoint
 from physicsnemo.models.domino.model import DoMINO
 from physicsnemo.utils.domino.utils import create_directory
 
+import cuml_knn_patch  # noqa: F401  -- see that file: works around a RAPIDS/physicsnemo cuML API mismatch
 from loss import compute_loss_dict
 from utils import (
     all_reduce_dict,

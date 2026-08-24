@@ -191,7 +191,7 @@ What to do differently there vs. the local setup described above:
 
    **If you can't get cuML working at all** and need to unblock evaluation
    in the meantime: `test.py` defaults to evaluating each case's *full*
-   surface mesh, which is exactly what makes the brute-force fallback OOm
+   surface mesh, which is exactly what makes the brute-force fallback OOM
    (`full_mesh_points x full_mesh_points`). Set `eval.sampling=true` and
    `eval.surface_points_sample=<N>` (see `conf/config.yaml` for the sizing
    formula) to evaluate a bounded random subset of each case's surface
