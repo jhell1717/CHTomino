@@ -99,9 +99,16 @@ def get_keys_to_read(cfg: DictConfig, get_ground_truth: bool = True):
     """
     Determine which arrays to read from each case's .zarr group.
 
-    Also builds the fallback `global_params_reference` tensor from
-    cfg.variables.global_parameters, used if a case's .zarr is missing that
-    array (see physicsnemo.datapipes.cae.cae_dataset.BackendReader.fill_optional_keys).
+    `global_params_reference` is read from each case's own .zarr file (its
+    order there must match `global_params_values`' order, whatever that is
+    -- both are written by the same data-curation pipeline, so this is the
+    authoritative source). The `keys_to_read_if_available` fallback below is
+    only used if a specific case's .zarr is missing that array; built from
+    cfg.variables.global_parameters in *declared* order, matching this
+    project's documented convention (see conf/config.yaml). Note this means
+    the fallback is only correct if that convention actually holds for the
+    case at hand -- unlike the primary, per-case path, there's no way to
+    verify it here.
     """
     assert_surface_only(cfg)
 
@@ -111,6 +118,7 @@ def get_keys_to_read(cfg: DictConfig, get_ground_truth: bool = True):
         "stl_faces",
         "stl_areas",
         "global_params_values",
+        "global_params_reference",
         "surface_mesh_centers",
         "surface_normals",
         "surface_areas",

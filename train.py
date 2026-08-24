@@ -217,10 +217,15 @@ def main(cfg: DictConfig) -> None:
             _flatten(OmegaConf.to_container(cfg, resolve=True))
             mlflow.log_params(flat_cfg)
 
+            # sort_keys=False: test.py's eval.model_config loads this file back
+            # via OmegaConf.load() to evaluate this checkpoint later, and dict
+            # iteration order matters (see utils.get_keys_to_read) -- alphabetic
+            # sorting here would silently reorder cfg.variables.global_parameters
+            # relative to how it was declared when this run actually trained.
             config_path = os.path.join(cfg.output, "resolved_config.yaml")
             os.makedirs(os.path.dirname(config_path), exist_ok=True)
             with open(config_path, "w") as f:
-                f.write(OmegaConf.to_yaml(cfg, sort_keys=True))
+                f.write(OmegaConf.to_yaml(cfg, sort_keys=False))
             mlflow.log_artifact(config_path)
 
         gpu_handle = None
