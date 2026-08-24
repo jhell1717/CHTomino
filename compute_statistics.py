@@ -13,6 +13,7 @@ import time
 
 import hydra
 import torch
+from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 from physicsnemo.datapipes.cae.domino_datapipe import compute_scaling_factors
@@ -66,6 +67,9 @@ def main(cfg: DictConfig) -> None:
         min_val={k: v.cpu().numpy() for k, v in min_val.items()},
         max_val={k: v.cpu().numpy() for k, v in max_val.items()},
         field_keys=TARGET_KEYS,
+        source_input_dir=to_absolute_path(cfg.data.input_dir),
+        computed_at=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        num_samples=cfg.data.max_samples_for_statistics,
     )
 
     compute_time = time.perf_counter() - start_time

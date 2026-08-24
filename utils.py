@@ -57,6 +57,11 @@ class ScalingFactors:
         min_val: Dictionary mapping keys to minimum value numpy arrays.
         max_val: Dictionary mapping keys to maximum value numpy arrays.
         field_keys: List of field keys for which statistics were computed.
+        source_input_dir: data.input_dir this was computed from (provenance
+            only -- verify against, don't rely on it programmatically).
+        computed_at: Human-readable UTC timestamp of when this was computed.
+        num_samples: How many cases contributed to these statistics
+            (data.max_samples_for_statistics, capped by dataset size).
     """
 
     mean: Dict[str, np.ndarray]
@@ -64,6 +69,9 @@ class ScalingFactors:
     min_val: Dict[str, np.ndarray]
     max_val: Dict[str, np.ndarray]
     field_keys: list[str]
+    source_input_dir: str = "unknown"
+    computed_at: str = "unknown"
+    num_samples: int | None = None
 
     def save(self, filepath: str | Path) -> None:
         """Save scaling factors to a pickle file."""
@@ -84,7 +92,15 @@ class ScalingFactors:
 
     def summary(self) -> str:
         """Generate a human-readable summary of the scaling factors."""
-        lines = ["Scaling Factors Summary:", f"Field Keys: {self.field_keys}"]
+        # getattr fallbacks: a .pkl saved before these provenance fields
+        # existed will unpickle without them set at all, not just defaulted.
+        lines = [
+            "Scaling Factors Summary:",
+            f"Computed at: {getattr(self, 'computed_at', 'unknown (pre-provenance-tracking file)')}",
+            f"Source input dir: {getattr(self, 'source_input_dir', 'unknown (pre-provenance-tracking file)')}",
+            f"Num samples: {getattr(self, 'num_samples', 'unknown (pre-provenance-tracking file)')}",
+            f"Field Keys: {self.field_keys}",
+        ]
         for key in self.field_keys:
             lines.append(f"\n{key}:")
             lines.append(f"  Shape: {self.mean[key].shape}")
@@ -174,12 +190,24 @@ def load_scaling_factors(cfg: DictConfig, logger=None) -> torch.Tensor:
 
     try:
         scaling_factors = ScalingFactors.load(pickle_path)
-        if logger is not None:
-            logger.info(f"Scaling factors loaded from: {pickle_path}")
     except FileNotFoundError:
         raise FileNotFoundError(
             f"Scaling factors not found at: {pickle_path}; run compute_statistics.py first."
         )
+
+    # Provenance, printed every time so it's easy to eyeball whether these
+    # actually match the run being trained/evaluated -- there's no automatic
+    # way to verify that, only to make it visible.
+    provenance = (
+        f"Scaling factors loaded from: {pickle_path}\n"
+        f"  computed at:      {getattr(scaling_factors, 'computed_at', 'unknown (pre-provenance-tracking file)')}\n"
+        f"  source input dir: {getattr(scaling_factors, 'source_input_dir', 'unknown (pre-provenance-tracking file)')}\n"
+        f"  num samples:      {getattr(scaling_factors, 'num_samples', 'unknown (pre-provenance-tracking file)')}"
+    )
+    if logger is not None:
+        logger.info(provenance)
+    else:
+        print(provenance)
 
     if cfg.model.normalization == "min_max_scaling":
         surf_factors = np.asarray(
