@@ -17,20 +17,18 @@ physicsnemo's explicit stream binding, so this adds explicit
 synchronization around the cuML/cupy call instead, trading a little
 performance for correctness safety.
 
-NOT imported by default. The preferred fix (see README "Moving to a real
-NVIDIA GPU") is pinning cuml-cu12/cuml-cu11 to a 25.x point release, which
-needs no code changes at all -- physicsnemo 1.3.0 was itself built against a
-25.x RAPIDS release (confirmed via its own Dockerfile), and physicsnemo's
-own later fix for this exact bug (v2.1.1, cuml>=26.2.0) does what this file
-does, which is decent evidence a 25.x cuml still has `Handle`. Only reach
-for this file if no available 25.x point release does.
+Imported by train.py / test.py / compute_statistics.py already
+(`import cuml_knn_patch  # noqa: F401`, near the top of each file). It's a
+no-op if cuML isn't installed/available at all, so it's harmless to import
+even on a machine without a GPU (e.g. the one this project was built on).
 
-To use it, add this import to the top of train.py / test.py /
-compute_statistics.py (whichever you're running), before any other
-physicsnemo import:
-    import cuml_knn_patch  # noqa: F401
-It's a no-op if cuML isn't installed/available at all, so it's harmless to
-import even on a machine without a GPU.
+Pinning cuml-cu12/cuml-cu11 to a 25.x point release instead (see README
+"Moving to a real NVIDIA GPU") needs no code changes at all, and
+physicsnemo 1.3.0 was itself built against a 25.x RAPIDS release (confirmed
+via its own Dockerfile) -- so if that pin alone gets `cuml.Handle` working,
+this file's patch becomes redundant (harmless either way, since it only
+changes behavior when CUML_AVAILABLE and points are on CUDA) and can be
+removed from the three imports above if you'd rather not carry it.
 
 UNVERIFIED beyond static reasoning about cuML's public API and the
 traceback that motivated it -- there was no GPU/cuML available in the

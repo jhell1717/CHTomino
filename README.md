@@ -179,15 +179,18 @@ What to do differently there vs. the local setup described above:
    `25.10.*` is a well-supported guess, not a guarantee -- if `cuml.Handle`
    still doesn't exist, try adjacent point releases (`25.08.*`, `25.06.*`,
    ... run `pip index versions cuml-cu12` to see what's available) until one
-   works. If no 25.x release has `cuml.Handle` on your setup,
-   `cuml_knn_patch.py` in this repo is a code-level fallback (not imported
-   by default -- add `import cuml_knn_patch` to the top of whichever script
-   you're running, before any other physicsnemo import, to enable it): it
-   reimplements physicsnemo's kNN dispatch but routes the cuML backend
-   through `cuml.neighbors.NearestNeighbors` directly instead of a manually
-   built `Handle`, matching physicsnemo's own later (v2.1.1) fix. It's
-   unverified the same way -- there's no cuML/GPU in the environment this
-   project was built in.
+   works.
+
+   `cuml_knn_patch.py` in this repo is a code-level fallback for this
+   specific bug, already imported at the top of `train.py`/`test.py`/
+   `compute_statistics.py` -- it reimplements physicsnemo's kNN dispatch but
+   routes the cuML backend through `cuml.neighbors.NearestNeighbors`
+   directly instead of a manually built `Handle`, matching physicsnemo's own
+   later (v2.1.1) fix. It's a no-op unless cuML is actually available and
+   points are on CUDA, so it's harmless to leave in even if the version pin
+   above resolves things on its own -- but it's unverified the same way as
+   everything else here: there's no cuML/GPU in the environment this project
+   was built in.
 
    **If you can't get cuML working at all** and need to unblock evaluation
    in the meantime: `test.py` defaults to evaluating each case's *full*
