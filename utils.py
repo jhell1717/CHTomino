@@ -115,16 +115,20 @@ def get_keys_to_read(cfg: DictConfig, get_ground_truth: bool = True):
     """
     Determine which arrays to read from each case's .zarr group.
 
-    `global_params_reference` is read from each case's own .zarr file (its
-    order there must match `global_params_values`' order, whatever that is
-    -- both are written by the same data-curation pipeline, so this is the
-    authoritative source). The `keys_to_read_if_available` fallback below is
-    only used if a specific case's .zarr is missing that array; built from
-    cfg.variables.global_parameters in *declared* order, matching this
-    project's documented convention (see conf/config.yaml). Note this means
-    the fallback is only correct if that convention actually holds for the
-    case at hand -- unlike the primary, per-case path, there's no way to
-    verify it here.
+    `global_params_reference` is deliberately NOT read from the .zarr files,
+    even though they contain it -- it's always built from
+    cfg.variables.global_parameters instead (in declared order; this relies
+    on train.py no longer alphabetically resorting keys when it writes
+    resolved_config.yaml, see its sort_keys=False). This is a consistency
+    choice, not a claim that config-derived values are more "correct" than
+    whatever's in the .zarr: every model trained with this codebase so far
+    was trained against the config-derived vector (reading from .zarr wasn't
+    implemented until it briefly was here and got reverted), so evaluating
+    an existing checkpoint must keep using the same source it was trained
+    with, whatever that source's own accuracy against the raw data actually
+    is. Only switch this to read from .zarr if you also retrain every
+    checkpoint you evaluate afterward -- the two sources must never be mixed
+    between a checkpoint's training run and its evaluation.
     """
     assert_surface_only(cfg)
 
@@ -134,7 +138,6 @@ def get_keys_to_read(cfg: DictConfig, get_ground_truth: bool = True):
         "stl_faces",
         "stl_areas",
         "global_params_values",
-        "global_params_reference",
         "surface_mesh_centers",
         "surface_normals",
         "surface_areas",
