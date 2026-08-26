@@ -185,6 +185,23 @@ def main(cfg: DictConfig) -> None:
 
     surface_variable_names = list(model_cfg.variables.surface.solution.keys())
 
+    # See conf/config.yaml's data.temperature_reference_key docstring: if set,
+    # surface_fields in this data is a delta from that boundary condition
+    # (scripts/rebase_surface_temperature.py), not absolute temperature.
+    # Metrics below are computed on the delta values as-is (that's what the
+    # model actually predicts); this is only used further down to add the
+    # reference back for human-facing .vtp/plot output.
+    temperature_reference_key = model_cfg.data.get("temperature_reference_key", None)
+    if temperature_reference_key:
+        reference_bc_index = list(model_cfg.variables.global_parameters.keys()).index(
+            temperature_reference_key
+        )
+        print(
+            f"data.temperature_reference_key={temperature_reference_key!r}: adding it back "
+            "to predictions/targets before saving .vtp/plot output (metrics above are still "
+            "computed on the delta values the model was trained on)."
+        )
+
     l2_all = []
     l2_centered_all = []
     all_pred, all_true = [], []
@@ -218,6 +235,11 @@ def main(cfg: DictConfig) -> None:
         pred_np = pred_phys[0].cpu().numpy()
         true_np = true_phys[0].cpu().numpy()
         coords_np = coords_phys[0].cpu().numpy()
+
+        if temperature_reference_key:
+            reference_value = batch["global_params_values"][0, reference_bc_index, 0].item()
+            pred_np = pred_np + reference_value
+            true_np = true_np + reference_value
 
         cloud = pv.PolyData(coords_np)
         cloud[f"{surface_variable_names[0]}Pred"] = pred_np

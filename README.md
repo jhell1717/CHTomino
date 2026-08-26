@@ -122,6 +122,41 @@ validation loss improves -- this is what `test.py` loads by default).
 `TemperaturePred`/`TemperatureTrue` fields and a predicted-vs-true parity
 plot, under `eval.save_path`.
 
+### If relative-L2 looks good but predicted-vs-true shows no diagonal trend
+
+`model.normalization` (min-max or mean/std) is computed *globally* across all
+training cases (`compute_statistics.py`). If temperature shifts a lot
+case-to-case (different boundary conditions) relative to how much it actually
+varies *within* one case's surface, that global range -- and therefore the
+training loss and the plain relative-L2 metric -- is dominated by the
+cross-case shift, not the spatial pattern. A model can then score a good
+relative L2 while barely resolving the actual spatial pattern, sometimes with
+predicted values scattered more widely than the true field and uncorrelated
+with it (a "blob" instead of a diagonal in the parity plot). `test.py` prints
+a second metric, `l2_surf_temperature_centered` (mean-centered per case,
+isolating spatial-pattern accuracy from baseline accuracy) -- if it's much
+worse than the plain number, this is what's happening.
+
+Fix: reframe the target as a delta from a boundary-condition reference
+temperature instead of absolute temperature, so neither the loss nor the
+global normalization range is dominated by the cross-case shift:
+
+```bash
+python scripts/rebase_surface_temperature.py data/train data/train_delta
+python scripts/rebase_surface_temperature.py data/val data/val_delta
+python scripts/rebase_surface_temperature.py data/test data/test_delta
+```
+
+Then point `data.input_dir`/`data.input_dir_val`/`eval.test_path` at the new
+`*_delta` directories, set `data.temperature_reference_key` to whichever
+boundary condition you subtracted (so `test.py` adds it back for
+interpretable `.vtp`/plot output -- metrics stay computed on the delta
+values), delete the now-stale `scaling_factors.pkl`, and retrain from
+scratch. See that script's docstring for the full reasoning and why the
+reference has to come from a boundary condition, not the target field
+itself. A checkpoint trained on absolute temperature is not compatible with
+delta-temperature data or vice versa.
+
 ## Moving to a real NVIDIA GPU (e.g. an H100 VM)
 
 This project targets GPU training -- `conf/config.yaml`'s
@@ -371,6 +406,7 @@ loss.py                  Surface loss (point-wise + area-weighted)
 cuml_knn_patch.py        GPU-only: works around a RAPIDS/physicsnemo cuML API mismatch -- see "Moving to a real NVIDIA GPU"
 notebooks/data_distribution_analysis.ipynb   Inspect BC parameter and mesh-size distributions per train/val/test split
 scripts/make_synthetic_zarr.py   Generate tiny fake .zarr cases (demo / smoke test)
+scripts/rebase_surface_temperature.py   Rewrite .zarr cases to a delta-temperature target -- see "If relative-L2 looks good but predicted-vs-true shows no diagonal trend"
 tests/run_smoke_test.sh  End-to-end pipeline smoke test (see above)
 devtools/dali_stub/      Local-only import shim -- see "Environment notes"
 ```
