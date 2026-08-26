@@ -64,8 +64,8 @@ variables:
       reference: [0.01]
 
 data: # Input directories for training and validation data (each a folder of *.zarr cases)
-  input_dir: data/train
-  input_dir_val: data/val
+  input_dir: /Users/joshuahellewell/Desktop/claude/scripts/train
+  input_dir_val: /Users/joshuahellewell/Desktop/claude/scripts/val
   # TODO: set these to the real physical coordinate range of your geometry
   # (in the same units as stl_coordinates/surface_mesh_centers in your .zarr
   # files). DoMINO uses this box to normalize coordinates into [-1, 1] and to
@@ -83,18 +83,25 @@ data: # Input directories for training and validation data (each a folder of *.z
   normalize_coordinates: true
   sample_in_bbox: false
   sampling: true
-  # Set to a key in variables.global_parameters (e.g. "Temp_inlet") if
-  # input_dir/input_dir_val/eval.test_path point at data produced by
+  # Set if input_dir/input_dir_val/eval.test_path point at data produced by
   # scripts/rebase_surface_temperature.py (surface_fields = absolute
-  # temperature minus that boundary condition's value per case), rather than
-  # raw absolute temperature. null (default) means surface_fields is
-  # untouched absolute temperature. Only test.py reads this (to add the
-  # reference back for interpretable .vtp/plot output) -- train.py, loss.py,
-  # and the L2 metrics are agnostic to which convention the data is in and
-  # need no changes either way. See that script's docstring for why you'd
-  # want this: it directly addresses relative-L2 metrics looking good while
-  # predicted-vs-true parity plots show no diagonal trend.
+  # temperature minus a boundary-condition-derived reference per case),
+  # rather than raw absolute temperature. Both null (default) means
+  # surface_fields is untouched absolute temperature. Only test.py reads
+  # these (to add the reference back for interpretable .vtp/plot output) --
+  # train.py, loss.py, and the L2 metrics are agnostic to which convention
+  # the data is in and need no changes either way. See that script's
+  # docstring for why you'd want this: it directly addresses relative-L2
+  # metrics looking good while predicted-vs-true parity plots show no
+  # diagonal trend.
+  #   temperature_reference_key: set to a key in variables.global_parameters
+  #     if the data was rebased with that script's --mode single.
+  #   temperature_reference_fit: set to the JSON path from that script's
+  #     --mode linear --fit-output/--fit-input if the data was rebased with
+  #     a fitted linear combination of BCs instead of a single one (takes
+  #     precedence over temperature_reference_key if both are set).
   temperature_reference_key: null
+  temperature_reference_fit: null
   scaling_factors: ${project_dir}/scaling_factors/scaling_factors.pkl
   max_samples_for_statistics: 200
   # Required by DoMINODataPipe's constructor regardless of model_type; only
@@ -226,7 +233,7 @@ val: # Validation configurable parameters
 # │          Testing data Configs             │
 # └───────────────────────────────────────────┘
 eval: # Testing configurable parameters
-  test_path: data/test # dir of *.zarr test cases, same layout as data.input_dir
+  test_path: /Users/joshuahellewell/Desktop/claude/scripts/test # dir of *.zarr test cases, same layout as data.input_dir
   save_path: outputs/${project.name}/predicted # dir to save predicted-vs-true .vtp point clouds and parity plots
   # By default, test.py loads the best checkpoint from this run's own
   # resume_dir/best_model (the highest-epoch file there, written by train.py

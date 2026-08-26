@@ -17,6 +17,7 @@ resolved_config.yaml; only eval.* itself (where to find test data, where to
 save predictions) still comes from the live config passed to this script.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -185,17 +186,37 @@ def main(cfg: DictConfig) -> None:
 
     surface_variable_names = list(model_cfg.variables.surface.solution.keys())
 
-    # See conf/config.yaml's data.temperature_reference_key docstring: if set,
-    # surface_fields in this data is a delta from that boundary condition
-    # (scripts/rebase_surface_temperature.py), not absolute temperature.
-    # Metrics below are computed on the delta values as-is (that's what the
-    # model actually predicts); this is only used further down to add the
-    # reference back for human-facing .vtp/plot output.
+    # See conf/config.yaml's data.temperature_reference_key/_fit docstring: if
+    # either is set, surface_fields in this data is a delta from a
+    # boundary-condition-derived reference (scripts/rebase_surface_temperature.py),
+    # not absolute temperature. Metrics below are computed on the delta
+    # values as-is (that's what the model actually predicts); reference_fn,
+    # if set, is only used further down to add the reference back for
+    # human-facing .vtp/plot output.
+    bc_names = list(model_cfg.variables.global_parameters.keys())
+    reference_fit_path = model_cfg.data.get("temperature_reference_fit", None)
     temperature_reference_key = model_cfg.data.get("temperature_reference_key", None)
-    if temperature_reference_key:
-        reference_bc_index = list(model_cfg.variables.global_parameters.keys()).index(
-            temperature_reference_key
+    reference_fn = None
+    if reference_fit_path:
+        with open(to_absolute_path(reference_fit_path)) as f:
+            reference_fit = json.load(f)
+        if reference_fit["bc_names"] != bc_names:
+            raise ValueError(
+                f"{reference_fit_path} was fit against BC order {reference_fit['bc_names']}, "
+                f"but this run's config declares {bc_names} -- these must match."
+            )
+        fit_coeffs = np.array([reference_fit["coefficients"][name] for name in bc_names])
+        fit_intercept = reference_fit["intercept"]
+        reference_fn = lambda bc_values: float(np.dot(fit_coeffs, bc_values) + fit_intercept)
+        print(
+            f"data.temperature_reference_fit={reference_fit_path!r}: adding the fitted "
+            "linear-combination reference back to predictions/targets before saving "
+            ".vtp/plot output (metrics above are still computed on the delta values the "
+            "model was trained on)."
         )
+    elif temperature_reference_key:
+        reference_bc_index = bc_names.index(temperature_reference_key)
+        reference_fn = lambda bc_values: float(bc_values[reference_bc_index])
         print(
             f"data.temperature_reference_key={temperature_reference_key!r}: adding it back "
             "to predictions/targets before saving .vtp/plot output (metrics above are still "
@@ -236,8 +257,9 @@ def main(cfg: DictConfig) -> None:
         true_np = true_phys[0].cpu().numpy()
         coords_np = coords_phys[0].cpu().numpy()
 
-        if temperature_reference_key:
-            reference_value = batch["global_params_values"][0, reference_bc_index, 0].item()
+        if reference_fn is not None:
+            case_bc_values = batch["global_params_values"][0, :, 0].cpu().numpy()
+            reference_value = reference_fn(case_bc_values)
             pred_np = pred_np + reference_value
             true_np = true_np + reference_value
 
