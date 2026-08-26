@@ -186,6 +186,7 @@ def main(cfg: DictConfig) -> None:
     surface_variable_names = list(model_cfg.variables.surface.solution.keys())
 
     l2_all = []
+    l2_centered_all = []
     all_pred, all_true = [], []
     for idx, case_name in enumerate(case_names):
         with torch.no_grad():
@@ -194,8 +195,13 @@ def main(cfg: DictConfig) -> None:
 
         metrics = compute_l2(prediction_surf, batch, test_dataloader)
         rel_l2 = metrics["l2_surf_temperature"].item()
+        rel_l2_centered = metrics["l2_surf_temperature_centered"].item()
         l2_all.append(rel_l2)
-        print(f"[{case_name}] relative L2 (surface {surface_variable_names}): {rel_l2:.5f}")
+        l2_centered_all.append(rel_l2_centered)
+        print(
+            f"[{case_name}] relative L2 (surface {surface_variable_names}): {rel_l2:.5f}  "
+            f"(mean-centered, i.e. spatial-pattern-only: {rel_l2_centered:.5f})"
+        )
 
         _, pred_phys = test_dataloader.unscale_model_outputs(surface_fields=prediction_surf)
         _, true_phys = test_dataloader.unscale_model_outputs(surface_fields=batch["surface_fields"])
@@ -241,6 +247,15 @@ def main(cfg: DictConfig) -> None:
         print(f"Saved combined pred-vs-actual plot to '{combined_path}'")
 
     print(f"Mean relative L2 over {len(l2_all)} case(s): {np.mean(l2_all):.5f}")
+    print(
+        f"Mean mean-centered relative L2 (spatial-pattern-only) over {len(l2_centered_all)} "
+        f"case(s): {np.mean(l2_centered_all):.5f}"
+    )
+    print(
+        "If the plain relative L2 above looks good but the mean-centered one is much worse, "
+        "the model is mostly reproducing each case's baseline temperature rather than the "
+        "spatial pattern across its surface -- see the pred-vs-true plots and README for more."
+    )
 
 
 if __name__ == "__main__":

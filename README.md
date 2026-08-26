@@ -74,11 +74,16 @@ pip install -r requirements.txt
   Don't use this on the real training cluster -- install the real package
   there instead.
 
-- **`warp-lang` must stay pinned to `1.7.2`** (see `requirements.txt`).
-  PhysicsNeMo 1.3.0's neighbor/SDF code breaks against `warp-lang >= 1.8`
+- **`warp-lang` must stay pinned to `1.12.0`** (see `requirements.txt`) --
+  bisected directly against two conflicting upstream constraints:
+  physicsnemo 1.3.0's neighbor/SDF code breaks against `warp-lang >= 1.13`
   (`AttributeError: module 'warp' has no attribute 'context'` at import
-  time) -- this is an upstream incompatibility, not specific to this
-  project.
+  time), while `warp-lang < 1.8.1` fails on a CUDA driver reporting CUDA
+  13.0 (`Warp CUDA error: Failed to get driver entry point
+  'cuDeviceGetUuid'`, a confirmed upstream bug,
+  [NVIDIA/warp#940](https://github.com/NVIDIA/warp/issues/940), fixed in
+  1.8.1). `1.12.0` is the newest release satisfying both. Neither of these
+  is specific to this project.
 
 - **No NVIDIA GPU here.** `data.gpu_preprocessing` / `data.gpu_output` /
   `train.amp.enabled` all default to GPU-oriented settings in
@@ -136,9 +141,14 @@ What to do differently there vs. the local setup described above:
    `requirements.txt` and "Environment notes" above. Do **not** put
    `devtools/dali_stub` on `PYTHONPATH` there; it's a local/no-GPU-only
    shim, and if it's importable it'll silently shadow the real DALI package.
-3. **Keep the `warp-lang==1.7.2` pin.** The incompatibility it works around
-   (`warp-lang >= 1.8` breaking physicsnemo 1.3.0's neighbor/SDF imports) is
-   a warp API-version issue, not a CPU-vs-GPU one -- it applies on the VM too.
+3. **Keep the `warp-lang==1.12.0` pin.** See "Environment notes" above --
+   it's bisected to satisfy two conflicting upstream constraints at once
+   (physicsnemo 1.3.0 breaks above 1.12.x; CUDA-13.0-reporting drivers, which
+   is what you're likely to hit on a real GPU box, break below 1.8.1). If
+   you still see `Warp CUDA error: Failed to get driver entry point
+   'cuDeviceGetUuid'` with this pin in place, your driver may report a CUDA
+   version outside what's been verified here -- check `nvidia-smi`'s
+   reported CUDA version against [NVIDIA/warp#940](https://github.com/NVIDIA/warp/issues/940).
 4. **Install RAPIDS cuML -- required, not optional, for any non-trivial mesh
    size.** `physicsnemo.utils.neighbors.knn()` (used by `DoMINODataPipe` on
    every case, for both training and evaluation) picks its backend based on
@@ -191,6 +201,41 @@ What to do differently there vs. the local setup described above:
    above resolves things on its own -- but it's unverified the same way as
    everything else here: there's no cuML/GPU in the environment this project
    was built in.
+
+   **If you hit `AttributeError: type object 'BaseEstimator' has no
+   attribute '_get_default_requests'`**: this is a different bug, once
+   `import cuml` itself succeeds. `import cuml` transitively imports
+   `cuml.accel` (an unrelated sklearn-acceleration feature, dragged in even
+   though nothing here uses it), and cuml 25.10's
+   `cuml/accel/estimator_proxy.py` directly calls
+   `BaseEstimator._get_default_requests` (verified against cuml's own
+   source). Checked against scikit-learn's source across releases: that
+   method exists in scikit-learn 1.3.x-1.7.x and was **removed starting in
+   1.8.0** (not 1.9 -- an earlier version of this note said 1.9, verify
+   against source rather than trust that if it still doesn't work). cuml
+   only declares `scikit-learn>=1.5` (no upper bound), so any unpinned `pip
+   install` in the environment can silently pull scikit-learn up to 1.8+ --
+   including ones unrelated to cuml itself. Fix:
+   ```bash
+   pip install "scikit-learn<1.8"
+   ```
+   (also pinned, commented, in `requirements.txt`). If this keeps
+   recurring after later `pip install`s in the same environment, that's
+   this same silent-upgrade pattern happening again, not a new issue.
+
+   **If you hit `ModuleNotFoundError: No module named 'cupy'` despite
+   `cupy-cuda12x` showing as installed**: `cupy-cuda12x` is the pip package
+   name; the import is always just `cupy`. First confirm you're checking the
+   same Python (`python -c "import sys; print(sys.executable)"` vs. `pip
+   show cupy-cuda12x`'s `Location:`). If those match and `python -c "import
+   cupy"` still fails on its own, the install itself is broken -- likely
+   fallout from having both `cupy-cuda12x` and `cupy-cuda13x` installed at
+   once (both claim the same `cupy` import namespace). Purge and reinstall:
+   ```bash
+   pip uninstall -y cupy-cuda12x cupy-cuda13x cupy
+   pip cache purge
+   pip install cupy-cuda12x
+   ```
 
    **If you can't get cuML working at all** and need to unblock evaluation
    in the meantime: `test.py` defaults to evaluating each case's *full*
@@ -324,6 +369,7 @@ test.py                  Evaluate a checkpoint against held-out .zarr test cases
 utils.py                 Config-derived sizing, scaling factors, L2 metrics
 loss.py                  Surface loss (point-wise + area-weighted)
 cuml_knn_patch.py        GPU-only: works around a RAPIDS/physicsnemo cuML API mismatch -- see "Moving to a real NVIDIA GPU"
+notebooks/data_distribution_analysis.ipynb   Inspect BC parameter and mesh-size distributions per train/val/test split
 scripts/make_synthetic_zarr.py   Generate tiny fake .zarr cases (demo / smoke test)
 tests/run_smoke_test.sh  End-to-end pipeline smoke test (see above)
 devtools/dali_stub/      Local-only import shim -- see "Environment notes"

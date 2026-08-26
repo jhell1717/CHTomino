@@ -248,11 +248,32 @@ def compute_l2(
 
 
 def metrics_fn_surface(pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Relative L2 error of predicted vs. target surface temperature."""
+    """Relative L2 error of predicted vs. target surface temperature.
+
+    Also reports a mean-centered variant: both `pred` and `target` have the
+    per-case mean of `target` subtracted before the same ratio is computed.
+    If a case's temperature sits on a large near-constant baseline (e.g. from
+    Temp_inlet) with much smaller spatial variation across its surface, the
+    uncentered metric above can look deceptively good even when the model is
+    mostly reproducing that baseline rather than the spatial pattern -- the
+    baseline dominates `target`'s norm. The centered variant divides out the
+    baseline and isolates how well the *spatial* variation is captured.
+    """
     l2_num = torch.sqrt(torch.sum((pred - target) ** 2, dim=1))
     l2_denom = torch.sqrt(torch.sum(target**2, dim=1))
     l2 = l2_num / l2_denom
-    return {"l2_surf_temperature": torch.mean(l2[:, 0])}
+
+    target_mean = torch.mean(target, dim=1, keepdim=True)
+    pred_c = pred - target_mean
+    target_c = target - target_mean
+    l2c_num = torch.sqrt(torch.sum((pred_c - target_c) ** 2, dim=1))
+    l2c_denom = torch.sqrt(torch.sum(target_c**2, dim=1))
+    l2_centered = l2c_num / l2c_denom
+
+    return {
+        "l2_surf_temperature": torch.mean(l2[:, 0]),
+        "l2_surf_temperature_centered": torch.mean(l2_centered[:, 0]),
+    }
 
 
 def all_reduce_dict(
