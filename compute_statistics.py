@@ -21,6 +21,7 @@ from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
 
 import cuml_knn_patch  # noqa: F401  -- see that file: works around a RAPIDS/physicsnemo cuML API mismatch
+import geometry_sampling_patch  # noqa: F401  -- see that file: area-weights geom_points_sample instead of uniform-per-vertex; inert here since compute_scaling_factors doesn't sample geometry points, kept for consistency with train.py/test.py
 from utils import ScalingFactors, assert_surface_only
 
 TARGET_KEYS = ["surface_fields", "stl_centers", "surface_mesh_centers"]

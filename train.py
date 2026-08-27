@@ -29,6 +29,7 @@ from physicsnemo.models.domino.model import DoMINO
 from physicsnemo.utils.domino.utils import create_directory
 
 import cuml_knn_patch  # noqa: F401  -- see that file: works around a RAPIDS/physicsnemo cuML API mismatch
+import geometry_sampling_patch  # noqa: F401  -- see that file: area-weights geom_points_sample instead of uniform-per-vertex
 from loss import compute_loss_dict
 from utils import (
     all_reduce_dict,
