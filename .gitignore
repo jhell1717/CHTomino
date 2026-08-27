@@ -3,6 +3,9 @@
 __pycache__/
 *.pyc
 
+# macOS
+.DS_Store
+
 # Hydra / training outputs
 outputs/
 multirun/

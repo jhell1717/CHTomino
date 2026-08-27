@@ -137,25 +137,84 @@ a second metric, `l2_surf_temperature_centered` (mean-centered per case,
 isolating spatial-pattern accuracy from baseline accuracy) -- if it's much
 worse than the plain number, this is what's happening.
 
-Fix: reframe the target as a delta from a boundary-condition reference
-temperature instead of absolute temperature, so neither the loss nor the
-global normalization range is dominated by the cross-case shift:
+Fix: reframe the target as a delta from a boundary-condition-derived
+reference temperature instead of absolute temperature, so neither the loss
+nor the global normalization range is dominated by the cross-case shift.
+First check, in `notebooks/data_distribution_analysis.ipynb`'s "Which
+boundary condition actually predicts the per-case baseline?" cell, whether
+one BC alone is a good enough reference or whether you need a combination:
 
 ```bash
-python scripts/rebase_surface_temperature.py data/train data/train_delta
-python scripts/rebase_surface_temperature.py data/val data/val_delta
-python scripts/rebase_surface_temperature.py data/test data/test_delta
+# If one BC's correlation there is close to the all-BCs R^2 -- subtract that
+# single BC:
+python scripts/rebase_surface_temperature.py data/train data/train_delta --reference-key Temp_inlet
+python scripts/rebase_surface_temperature.py data/val data/val_delta --reference-key Temp_inlet
+python scripts/rebase_surface_temperature.py data/test data/test_delta --reference-key Temp_inlet
+
+# If no single BC gets close to the all-BCs R^2 -- fit a linear combination
+# on train, and reuse that exact fit for val/test (don't refit per split):
+python scripts/rebase_surface_temperature.py data/train data/train_delta \
+    --mode linear --fit-output outputs/temperature_reference_fit.json
+python scripts/rebase_surface_temperature.py data/val data/val_delta \
+    --mode linear --fit-input outputs/temperature_reference_fit.json
+python scripts/rebase_surface_temperature.py data/test data/test_delta \
+    --mode linear --fit-input outputs/temperature_reference_fit.json
 ```
 
 Then point `data.input_dir`/`data.input_dir_val`/`eval.test_path` at the new
-`*_delta` directories, set `data.temperature_reference_key` to whichever
-boundary condition you subtracted (so `test.py` adds it back for
-interpretable `.vtp`/plot output -- metrics stay computed on the delta
-values), delete the now-stale `scaling_factors.pkl`, and retrain from
-scratch. See that script's docstring for the full reasoning and why the
-reference has to come from a boundary condition, not the target field
-itself. A checkpoint trained on absolute temperature is not compatible with
+`*_delta` directories, set `data.temperature_reference_key` (single mode) or
+`data.temperature_reference_fit` (linear mode, path to the JSON file) so
+`test.py` adds the reference back for interpretable `.vtp`/plot output --
+metrics stay computed on the delta values -- delete the now-stale
+`scaling_factors.pkl`, and retrain from scratch. See that script's docstring
+for the full reasoning and why the reference has to come from boundary
+conditions, not the target field itself. A checkpoint trained on absolute
+temperature is not compatible with
 delta-temperature data or vice versa.
+
+### Geometry (STL) point sampling is area-weighted and face-interior, not uniform-per-vertex
+
+physicsnemo's `DoMINODataPipe.downsample_geometry` samples `model.geom_points_sample`
+points uniformly at random from `stl_coordinates` -- the raw triangle vertex array (3
+rows per triangle, not deduplicated). Since every triangle contributes exactly 3
+candidate points regardless of its area, uniform sampling is really uniform *per
+triangle*, not per unit of surface area: a face meshed with many small triangles gets
+oversampled and a face meshed with few large triangles gets undersampled, independent of
+which one is actually bigger.
+
+Reweighting which *vertex* gets picked (by triangle area) is not enough on its own,
+though -- confirmed against a real project `.zarr` (`ref_material/CASE_80.zarr`): its
+cylindrical walls have exactly 3 distinct Z-coordinates across all 96,144 vertices (the
+two rims, essentially every vertex on the mesh). No reweighting of *which vertex* gets
+picked can ever place a sample anywhere but those two rims, because no vertex exists
+anywhere in between -- vertex-based sampling can only ever return a location a vertex
+already occupies. `geometry_sampling_patch.py` instead samples a random point on each
+selected triangle's *face* (barycentric interpolation of its 3 vertices, weighted by
+triangle area for which triangle gets selected) -- this can place a sample anywhere on a
+triangle's surface, including a giant triangle's interior where no vertex exists at all.
+Verified: reweighting vertices alone put 0% of samples at any height strictly between
+this mesh's two rims; face-interior sampling puts ~65% there, uniformly spread across
+the wall's height, matching the wall's actual area. At a 5000-point budget, sampled
+points went from covering ~15% of the mesh's total surface area (uniform-per-vertex) to
+~85%+ (area-weighted, face-interior). Check with `notebooks/sampling_visualization.ipynb`
+-- its "Before/after: does sample allocation actually track surface area?" section
+reproduces this on whichever case(s) you point it at, and the ordinary scatter overlays
+above it can still look deceptively similar before/after for a coarsely-tessellated mesh
+like this one (both draw from a small pool of points near the same silhouette in
+projection) -- the before/after section is the reliable, projection-independent check.
+
+`model.surface_sampling_algorithm` already lets you pick area-weighted sampling for the
+*surface solution* points; physicsnemo has no equivalent config option for the *geometry*
+points, so `geometry_sampling_patch.py` (imported by default in `train.py`/`test.py`/
+`compute_statistics.py`) monkeypatches `DoMINODataPipe.downsample_geometry`. Unlike
+`cuml_knn_patch.py`, there's no non-code alternative (no config flag achieves this), and
+the effect size is large enough that it's on by default rather than opt-in; delete the
+three imports if you want physicsnemo's original uniform-per-vertex behavior back.
+**This changes what the geometry encoder actually sees during training** -- a checkpoint
+trained before vs. after adopting this patch isn't a fair before/after comparison of
+anything else you change at the same time. Sampled points are no longer necessarily
+original mesh vertices (they lie exactly on the mesh surface, just not always at a
+vertex) -- expected, and nothing else in this pipeline assumes otherwise.
 
 ## Moving to a real NVIDIA GPU (e.g. an H100 VM)
 
@@ -404,7 +463,9 @@ test.py                  Evaluate a checkpoint against held-out .zarr test cases
 utils.py                 Config-derived sizing, scaling factors, L2 metrics
 loss.py                  Surface loss (point-wise + area-weighted)
 cuml_knn_patch.py        GPU-only: works around a RAPIDS/physicsnemo cuML API mismatch -- see "Moving to a real NVIDIA GPU"
+geometry_sampling_patch.py   Area-weighted, face-interior STL geometry point sampling -- see "Geometry (STL) point sampling is area-weighted and face-interior, not uniform-per-vertex"
 notebooks/data_distribution_analysis.ipynb   Inspect BC parameter and mesh-size distributions per train/val/test split
+notebooks/sampling_visualization.ipynb   Visualize which points the real DoMINO datapipe samples per case, from the full surface mesh and STL geometry
 scripts/make_synthetic_zarr.py   Generate tiny fake .zarr cases (demo / smoke test)
 scripts/rebase_surface_temperature.py   Rewrite .zarr cases to a delta-temperature target -- see "If relative-L2 looks good but predicted-vs-true shows no diagonal trend"
 tests/run_smoke_test.sh  End-to-end pipeline smoke test (see above)
