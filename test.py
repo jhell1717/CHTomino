@@ -40,7 +40,7 @@ from physicsnemo.utils.domino.utils import create_directory, unnormalize
 
 import cuml_knn_patch  # noqa: F401  -- see that file: works around a RAPIDS/physicsnemo cuML API mismatch
 import geometry_sampling_patch  # noqa: F401  -- see that file: area-weights geom_points_sample instead of uniform-per-vertex
-from utils import assert_surface_only, compute_l2, get_keys_to_read, get_num_vars, load_scaling_factors
+from utils import assert_surface_only, compute_l2, get_keys_to_read, get_num_vars, load_scaling_factors, log_patch_status
 
 
 def resolve_model_and_checkpoint(cfg: DictConfig) -> tuple[DictConfig, str]:
@@ -122,6 +122,7 @@ def main(cfg: DictConfig) -> None:
 
     DistributedManager.initialize()
     dm = DistributedManager()
+    log_patch_status()
 
     checkpoint_files = list(Path(checkpoint_dir).glob("*.pt")) if Path(checkpoint_dir).exists() else []
     if not checkpoint_files:

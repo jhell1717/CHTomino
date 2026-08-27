@@ -22,7 +22,7 @@ from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
 
 import cuml_knn_patch  # noqa: F401  -- see that file: works around a RAPIDS/physicsnemo cuML API mismatch
 import geometry_sampling_patch  # noqa: F401  -- see that file: area-weights geom_points_sample instead of uniform-per-vertex; inert here since compute_scaling_factors doesn't sample geometry points, kept for consistency with train.py/test.py
-from utils import ScalingFactors, assert_surface_only
+from utils import ScalingFactors, assert_surface_only, log_patch_status
 
 TARGET_KEYS = ["surface_fields", "stl_centers", "surface_mesh_centers"]
 
@@ -39,6 +39,7 @@ def main(cfg: DictConfig) -> None:
     logger = RankZeroLoggingWrapper(logger, dm)
     logger.info("Starting scaling factors computation")
     logger.info(f"Config summary:\n{OmegaConf.to_yaml(cfg, sort_keys=True)}")
+    log_patch_status(logger)
 
     pickle_path = cfg.data.scaling_factors
     os.makedirs(os.path.dirname(pickle_path), exist_ok=True)

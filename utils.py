@@ -45,6 +45,34 @@ def assert_surface_only(cfg: DictConfig) -> None:
         )
 
 
+def log_patch_status(logger=None) -> None:
+    """Log whether the optional runtime patches this project applies are actually
+    active in THIS process -- not just whether the source file imports them.
+
+    Doesn't import cuml_knn_patch/geometry_sampling_patch itself: this only checks
+    the effect they have (a patched method bound to physicsnemo's class), so it
+    correctly reports False if a caller forgot to import them, and doesn't
+    duplicate applying them. Call this once near the start of train.py/test.py/
+    compute_statistics.py's main(), after their own patch imports at the top of
+    the file have already run.
+    """
+    from physicsnemo.datapipes.cae.domino_datapipe import DoMINODataPipe
+
+    geometry_patch_active = (
+        getattr(DoMINODataPipe.downsample_geometry, "__name__", None)
+        == "_downsample_geometry_area_weighted"
+    )
+    msg = (
+        f"geometry_sampling_patch active: {geometry_patch_active} "
+        "(area-weighted, face-interior STL point sampling; False means physicsnemo's "
+        "original uniform-per-vertex behavior is in effect -- see geometry_sampling_patch.py)"
+    )
+    if logger is not None:
+        logger.info(msg)
+    else:
+        print(msg)
+
+
 @dataclass
 class ScalingFactors:
     """

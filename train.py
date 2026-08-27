@@ -38,6 +38,7 @@ from utils import (
     get_keys_to_read,
     get_num_vars,
     load_scaling_factors,
+    log_patch_status,
     nvtx_range,
 )
 
@@ -237,6 +238,7 @@ def main(cfg: DictConfig) -> None:
         logger = PythonLogger("Train")
         logger = RankZeroLoggingWrapper(logger, dm)
         logger.info(f"Config summary:\n{OmegaConf.to_yaml(cfg, sort_keys=True)}")
+        log_patch_status(logger)
 
         ######################################################
         # Scaling factors and model sizing
